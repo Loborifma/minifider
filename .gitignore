@@ -1,0 +1,22 @@
+# PyInstaller build/output — тяжёлые, генерируются заново из исходников
+build/
+dist/
+
+# Вендоренный ffmpeg.exe (~83 МБ) — не кладём в git, чтобы не раздувать историю репозитория.
+# Нужен только для запуска из исходников и для сборки — качается отдельно
+# (см. README) и/или уже лежит внутри zip-архива в GitHub Releases.
+assets/ffmpeg.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
