@@ -157,6 +157,7 @@ def run_batch(
     files: list[str], preset_key: str, ui_queue, cancel_event=None, proc_holder=None,
     level_audio: bool = False, compress: bool = True, transcribe: bool = False,
     subtitle_format: str = "srt", get_local_model=None,
+    skip_paths=None, current_file_event=None,
 ) -> None:
     import groq_client
     import transcribe_worker as tw
@@ -166,11 +167,24 @@ def run_batch(
     total = len(files)
     for index, path in enumerate(files, start=1):
         if cancel_event is not None and cancel_event.is_set():
+            for remaining_index, remaining_path in enumerate(files[index - 1:], start=index):
+                ui_queue.put(("file_done", remaining_path, "cancelled", "Отменено пользователем"))
+                ui_queue.put(("batch_progress", remaining_index, total))
             break
+
+        basename = os.path.basename(path)
+
+        if skip_paths is not None and path in skip_paths:
+            ui_queue.put(("log", f"[{basename}] Отменено пользователем"))
+            ui_queue.put(("file_done", path, "cancelled", "Отменено пользователем"))
+            ui_queue.put(("batch_progress", index, total))
+            continue
+
+        if current_file_event is not None:
+            current_file_event.clear()
         if proc_holder is not None:
             proc_holder.clear()
 
-        basename = os.path.basename(path)
         compress_ok, compress_info, out_path = True, None, path
 
         if compress:
@@ -187,8 +201,11 @@ def run_batch(
             if not compress_ok:
                 ui_queue.put(("log", f"[{basename}] Ошибка сжатия: {compress_info}"))
 
+        cancelled = (cancel_event is not None and cancel_event.is_set()) or \
+                    (current_file_event is not None and current_file_event.is_set())
+
         transcribe_ok, transcribe_info = True, None
-        if transcribe:
+        if transcribe and not cancelled:
             source = out_path if (compress and compress_ok) else path
             ui_queue.put(("log", f"[{basename}] Транскрибирую..."))
             try:
@@ -196,7 +213,10 @@ def run_batch(
                     get_local_model, source, index, total,
                     log=lambda t, b=basename: ui_queue.put(("log", f"[{b}] {t}")),
                     output_format=subtitle_format, use_local_fallback=use_local_fallback,
+                    abort_event=current_file_event,
                 )
+            except tw.TranscriptionCancelled:
+                cancelled = True
             except tw.TranscriptionUnavailable as exc:
                 transcribe_ok, transcribe_info = False, str(exc)
                 ui_queue.put(("log", f"[{basename}] Ошибка транскрипции: {exc}"))
@@ -204,17 +224,19 @@ def run_batch(
                 transcribe_ok, transcribe_info = False, str(exc)
                 ui_queue.put(("log", f"[{basename}] Ошибка транскрипции: {exc}"))
 
-        if compress and transcribe:
-            ok = compress_ok and transcribe_ok
-        elif compress:
-            ok = compress_ok
+        if cancelled:
+            status, info = "cancelled", "Отменено пользователем"
+        elif (compress and transcribe and compress_ok and transcribe_ok) or \
+             (compress and not transcribe and compress_ok) or \
+             (transcribe and not compress and transcribe_ok):
+            status, info = "done", "OK"
         else:
-            ok = transcribe_ok
-        info = " / ".join(filter(None, [
-            None if compress_ok else compress_info,
-            None if transcribe_ok else transcribe_info,
-        ])) or "OK"
+            status = "error"
+            info = " / ".join(filter(None, [
+                None if compress_ok else compress_info,
+                None if transcribe_ok else transcribe_info,
+            ])) or "Неизвестная ошибка"
 
-        ui_queue.put(("file_done", path, ok, info))
+        ui_queue.put(("file_done", path, status, info))
         ui_queue.put(("batch_progress", index, total))
     ui_queue.put(("all_done",))

@@ -26,6 +26,10 @@ class TranscriptionUnavailable(Exception):
     pass
 
 
+class TranscriptionCancelled(Exception):
+    pass
+
+
 def load_model(log=print, progress=None):
     log("Загружаю модель large-v2...")
 
@@ -110,11 +114,14 @@ def _extract_compressed_audio(video_path, log=print):
     return tmp_path
 
 
-def transcribe_file(get_local_model, video_path, index, total, log=print, output_format="srt", use_local_fallback=False):
+def transcribe_file(get_local_model, video_path, index, total, log=print, output_format="srt", use_local_fallback=False, abort_event=None):
     path = Path(video_path)
     output_path = path.with_suffix(".srt" if output_format == "srt" else ".txt")
 
     log(f"Транскрибирую: {path.name}")
+
+    if abort_event is not None and abort_event.is_set():
+        raise TranscriptionCancelled(f"Отменено пользователем: {path.name}")
 
     segments = None
     key_idx = None
@@ -123,6 +130,8 @@ def transcribe_file(get_local_model, video_path, index, total, log=print, output
     if audio_path is not None:
         try:
             while True:
+                if abort_event is not None and abort_event.is_set():
+                    raise TranscriptionCancelled(f"Отменено пользователем: {path.name}")
                 segments, key_idx, model_used, wait_until = groq_client.transcribe_with_fallback_keys(
                     audio_path, language="ru", log=log
                 )
@@ -134,7 +143,15 @@ def transcribe_file(get_local_model, video_path, index, total, log=print, output
                         f"  Все ключи Groq временно исчерпали лимит. "
                         f"Жду до {resume_at}, затем продолжу автоматически..."
                     )
-                    time.sleep(max(0, wait_until - time.time()))
+                    remaining = max(0, wait_until - time.time())
+                    if abort_event is not None:
+                        woke_by_abort = abort_event.wait(timeout=remaining)
+                    else:
+                        time.sleep(remaining)
+                        woke_by_abort = False
+                    if woke_by_abort:
+                        log("  Отменено пользователем во время ожидания сброса лимита.")
+                        raise TranscriptionCancelled(f"Отменено пользователем: {path.name}")
                     log("  Лимиты должны были обновиться — пробую снова...")
                     continue
                 break
@@ -150,6 +167,9 @@ def transcribe_file(get_local_model, video_path, index, total, log=print, output
     if not use_local_fallback:
         log("  Groq API недоступен: ключи не настроены / все невалидны / файл слишком большой — файл пропущен")
         raise TranscriptionUnavailable(f"Groq API недоступен для {path.name}, локальный fallback отключён в настройках")
+
+    if abort_event is not None and abort_event.is_set():
+        raise TranscriptionCancelled(f"Отменено пользователем: {path.name}")
 
     log("  Использую локальную модель Whisper (fallback)...")
     model = get_local_model()

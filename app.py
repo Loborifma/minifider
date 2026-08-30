@@ -23,6 +23,7 @@ COLOR_STATUS_QUEUED = "#6b7280"
 COLOR_STATUS_PROGRESS = "#2563eb"
 COLOR_STATUS_DONE = "#1a7f37"
 COLOR_STATUS_ERROR = "#cf222e"
+COLOR_STATUS_CANCELLED = "#9aa1ab"
 
 
 class MainWindow:
@@ -38,6 +39,8 @@ class MainWindow:
         self.worker_thread: threading.Thread | None = None
         self.current_proc_path: str | None = None
         self.cancel_event = threading.Event()
+        self.current_file_event = threading.Event()
+        self.skip_paths: set[str] = set()
         self.proc_holder: list = []
         self._local_model = None
         self._files_snapshot: list[str] = []
@@ -275,14 +278,22 @@ class MainWindow:
         ctk.CTkLabel(
             row, text=os.path.basename(path), text_color=COLOR_TEXT, anchor="w",
         ).pack(side="left", fill="x", expand=True)
+        cancel_label = ctk.CTkLabel(
+            row, text="✕", text_color=COLOR_TEXT_MUTED, cursor="hand2", width=16,
+        )
+        cancel_label.pack(side="right", padx=(6, 0))
+        cancel_label.bind("<Button-1>", lambda e, p=path: self._cancel_file(p))
         status_label = ctk.CTkLabel(row, text="В очереди", text_color=COLOR_STATUS_QUEUED, anchor="e")
         status_label.pack(side="right")
-        self.row_widgets[path] = {"row": row, "status": status_label}
+        self.row_widgets[path] = {
+            "row": row, "status": status_label, "cancel": cancel_label, "status_kind": "queued",
+        }
 
-    def _set_row_status(self, path, text, color):
+    def _set_row_status(self, path, text, color, kind):
         widgets = self.row_widgets.get(path)
         if widgets:
             widgets["status"].configure(text=text, text_color=color)
+            widgets["status_kind"] = kind
 
     def _clear_file_rows(self):
         for widgets in self.row_widgets.values():
@@ -308,7 +319,7 @@ class MainWindow:
             messagebox.showwarning("minifider", "Выбери хотя бы одно действие: сжатие или транскрибация.")
             return
 
-        self.start_btn.configure(state="disabled")
+        self._set_running_mode(True)
         self._set_settings_link_enabled(False)
         self.progress_bar.set(0)
         preset = self.preset_var.get()
@@ -320,6 +331,8 @@ class MainWindow:
         self._batch_total = len(files_snapshot)
         self._update_status_line()
         self.cancel_event.clear()
+        self.current_file_event.clear()
+        self.skip_paths.clear()
         self.worker_thread = threading.Thread(
             target=fw.run_batch,
             args=(files_snapshot, preset, self.ui_queue, self.cancel_event, self.proc_holder),
@@ -329,6 +342,8 @@ class MainWindow:
                 "transcribe": transcribe,
                 "subtitle_format": subtitle_format,
                 "get_local_model": self._get_local_model,
+                "skip_paths": self.skip_paths,
+                "current_file_event": self.current_file_event,
             },
             daemon=True,
         )
@@ -347,14 +362,16 @@ class MainWindow:
         if kind == "progress":
             _, path, pct = msg
             self.current_proc_path = path
-            self._set_row_status(path, f"{pct}%", COLOR_STATUS_PROGRESS)
+            self._set_row_status(path, f"{pct}%", COLOR_STATUS_PROGRESS, "progress")
             self.progress_bar.set(pct / 100)
         elif kind == "file_done":
-            _, path, ok, info = msg
-            if ok:
-                self._set_row_status(path, "✓ Готово", COLOR_STATUS_DONE)
+            _, path, status, info = msg
+            if status == "done":
+                self._set_row_status(path, "✓ Готово", COLOR_STATUS_DONE, "done")
+            elif status == "cancelled":
+                self._set_row_status(path, "⊘ Отменено", COLOR_STATUS_CANCELLED, "cancelled")
             else:
-                self._set_row_status(path, f"⚠ Ошибка: {info}", COLOR_STATUS_ERROR)
+                self._set_row_status(path, f"⚠ Ошибка: {info}", COLOR_STATUS_ERROR, "error")
         elif kind == "batch_progress":
             _, index, total = msg
             self._done_count = index
@@ -368,22 +385,61 @@ class MainWindow:
             self._done_count = 0
             self._batch_total = 0
             self.status_label.configure(text="Готово к работе")
-            self.start_btn.configure(state="normal")
+            self._set_running_mode(False)
             self._set_settings_link_enabled(True)
             self.files.clear()
             self._clear_file_rows()
             messagebox.showinfo("minifider", "Обработка завершена")
+
+    def _cancel_file(self, path):
+        widgets = self.row_widgets.get(path)
+        if not widgets or widgets["status_kind"] in ("done", "error", "cancelled"):
+            return
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        self.skip_paths.add(path)
+        is_current = (
+            self._batch_total and self._done_count < self._batch_total
+            and self._files_snapshot[self._done_count] == path
+        )
+        if is_current:
+            self.current_file_event.set()
+            self._terminate_current_proc()
+        self._set_row_status(path, "Отменяется…", COLOR_TEXT_MUTED, "cancelling")
+
+    def _cancel_all(self):
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        self.cancel_event.set()
+        self.current_file_event.set()
+        self._terminate_current_proc()
+        self.status_label.configure(text="Отмена...")
+
+    def _terminate_current_proc(self):
+        for proc in list(self.proc_holder):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def _set_running_mode(self, running):
+        if running:
+            self.start_btn.configure(
+                text="Отменить всё", fg_color=COLOR_STATUS_ERROR, hover_color="#a91f2f",
+                command=self._cancel_all,
+            )
+        else:
+            self.start_btn.configure(
+                text="Начать обработку", fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+                command=self._on_start,
+            )
 
     def _on_close(self):
         if self.worker_thread and self.worker_thread.is_alive():
             if not messagebox.askyesno("minifider", "Сжатие ещё выполняется. Прервать и закрыть?"):
                 return
             self.cancel_event.set()
-            for proc in list(self.proc_holder):
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
+            self._terminate_current_proc()
             self.worker_thread.join(timeout=3)
         self.root.destroy()
 
